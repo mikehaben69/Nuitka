@@ -31,6 +31,7 @@ import sys
 from nuitka.__past__ import (  # pylint: disable=I0021,redefined-builtin
     long,
     unicode,
+    xrange,
 )
 from nuitka.codegen.Reports import onMissingTrust
 from nuitka.importing.IgnoreListing import getModuleIgnoreList
@@ -148,6 +149,57 @@ def makeExpressionAbsoluteImportNode(module_name, source_ref):
         level=makeConstantRefNode(0, source_ref, True),
         source_ref=source_ref,
     )
+
+
+class ExpressionImportModuleFixed(ExpressionBase):
+    """Hard coded import names, that we know to exist."
+
+    These created as result of builtin imports and importlib.import_module calls
+    that were compile time resolved, and for known module names.
+    """
+
+    kind = "EXPRESSION_IMPORT_MODULE_FIXED"
+
+    __slots__ = ("module_name",)
+
+    def __init__(self, module_name, source_ref):
+        ExpressionBase.__init__(self, source_ref=source_ref)
+
+        self.module_name = module_name
+
+    def finalize(self):
+        del self.parent
+
+    def getDetails(self):
+        return {"module_name": self.module_name}
+
+    def getModuleName(self):
+        return self.module_name
+
+    def mayHaveSideEffects(self):
+        return True
+
+    def mayRaiseException(self, exception_type):
+        # For included modules, we might be able to tell.
+        return True
+
+    def getTypeShape(self):
+        if self.module_name in sys.builtin_module_names:
+            return tshape_module_builtin
+        else:
+            return tshape_module
+
+    def computeExpressionRaw(self, trace_collection):
+        if self.mayRaiseException(BaseException):
+            trace_collection.onExceptionRaiseExit(BaseException)
+
+        return self, None, None
+
+    def computeExpressionImportName(self, import_node, import_name, trace_collection):
+        # TODO: For include modules, something might be possible here.
+        return self.computeExpressionAttribute(
+            import_node, import_name, trace_collection
+        )
 
 
 class ExpressionImportModuleHard(ExpressionBase):
@@ -385,7 +437,21 @@ class ExpressionImportlibImportModuleRef(ExpressionImportModuleNameHard):
             builtin_spec=importlib_import_module_spec,
         )
 
-        return result, "new_expression", "Call to 'importlib.import_module' resolved."
+        return result, "new_expression", "Call to 'importlib.import_module' recognized."
+
+
+def _getImportNameAsStr(value):
+    if value is None:
+        result = None
+    else:
+        result = value.getCompileTimeConstant()
+
+    if type(result) in (str, unicode):
+        # TODO: This is not handling decoding errors all that well.
+        if str is not unicode and type(result) is unicode:
+            result = str(result)
+
+    return result
 
 
 class ExpressionImportlibImportModuleCall(ExpressionChildrenHavingBase):
@@ -400,7 +466,69 @@ class ExpressionImportlibImportModuleCall(ExpressionChildrenHavingBase):
             self, values={"name": name, "package": package}, source_ref=source_ref
         )
 
+    @staticmethod
+    def _resolveImportLibName(module_name, package_name):
+        # Relative imports need to be resolved by package name.
+        if module_name.startswith("."):
+            if not package_name:
+                return None
+
+                # TODO: Static exception should be created and warned about, Python2/Python3 differ
+                # raise TypeError("relative imports require the 'package' argument")
+                # msg = ("the 'package' argument is required to perform a relative import for {!r}")
+                # raise TypeError(msg.format(name))
+
+            level = 0
+            for character in module_name:
+                if character != ".":
+                    break
+                level += 1
+            module_name = module_name[level:]
+
+            dot = len(package_name)
+            for _i in xrange(level, 1, -1):
+                try:
+                    dot = package_name.rindex(".", 0, dot)
+                except ValueError:
+                    return None
+                    # TODO: Static exception should be created and warned about.
+                    # raise ValueError("attempted relative import beyond top-level package")
+            return "%s.%s" % (package_name[:dot], module_name)
+
+        if package_name:
+            return "%s.%s" % (package_name, module_name)
+        else:
+            return module_name
+
     def computeExpression(self, trace_collection):
+        module_name = self.subnode_name
+        package_name = self.subnode_package
+
+        if (
+            package_name is None or package_name.isCompileTimeConstant()
+        ) and module_name.isCompileTimeConstant():
+            imported_module_name = _getImportNameAsStr(module_name)
+            imported_package_name = _getImportNameAsStr(package_name)
+
+            if (
+                imported_package_name is None or type(imported_package_name) is str
+            ) and type(imported_module_name) is str:
+                resolved_module_name = self._resolveImportLibName(
+                    imported_module_name, imported_package_name
+                )
+
+                if resolved_module_name is not None:
+                    result = ExpressionImportModuleFixed(
+                        module_name=resolved_module_name, source_ref=self.source_ref
+                    )
+
+                    return (
+                        result,
+                        "new_expression",
+                        "Resolved importlib.import_module call to import of '%s'."
+                        % resolved_module_name,
+                    )
+
         # Any code could be run, note that.
         trace_collection.onControlFlowEscape(self)
 
